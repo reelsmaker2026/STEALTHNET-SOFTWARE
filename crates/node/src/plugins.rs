@@ -268,6 +268,9 @@ pub fn apply(cfg: &PluginConfig) -> Result<(), String> {
     // порядок с чужим фаерволом был предсказуем.
     s.push_str("  chain input {\n");
     s.push_str("    type filter hook input priority filter; policy accept;\n");
+    s.push_str("    iif lo accept\n");
+    s.push_str("    ct state established,related accept\n");
+    s.push_str("    ct state invalid drop\n");
     s.push_str("    ip saddr @blocked4 counter drop\n");
     s.push_str("    ip6 saddr @blocked6 counter drop\n");
     if cfg.ingress_filter.enabled {
@@ -277,11 +280,19 @@ pub fn apply(cfg: &PluginConfig) -> Result<(), String> {
     if cfg.anti_scanner.enabled {
         s.push_str("    ip saddr @scanners4 counter drop\n");
         s.push_str("    ip6 saddr @scanners6 counter drop\n");
+        s.push_str("    tcp flags syn meter synlimit4 { ip saddr limit rate over 200/second burst 300 packets } counter drop\n");
+        s.push_str("    tcp flags syn meter synlimit6 { ip6 saddr limit rate over 200/second burst 300 packets } counter drop\n");
     }
+    s.push_str("  }\n");
+
+    s.push_str("  chain forward {\n");
+    s.push_str("    type filter hook forward priority filter; policy accept;\n");
+    s.push_str("    tcp flags syn tcp option maxseg size set rt mtu\n");
     s.push_str("  }\n");
 
     s.push_str("  chain output {\n");
     s.push_str("    type filter hook output priority filter; policy accept;\n");
+    s.push_str("    tcp flags syn tcp option maxseg size set rt mtu\n");
     if cfg.egress_filter.enabled {
         s.push_str("    ip daddr @egress4 counter drop\n");
         s.push_str("    ip6 daddr @egress6 counter drop\n");
@@ -315,10 +326,77 @@ pub fn is_valid_cidr_or_ip(s: &str) -> bool {
     true
 }
 
+pub fn get_local_node_ips() -> Vec<std::net::IpAddr> {
+    let mut ips = Vec::new();
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("1.1.1.1:80").is_ok() {
+            if let Ok(local) = socket.local_addr() {
+                let ip = local.ip();
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    ips.push(ip);
+                }
+            }
+        }
+    }
+    if let Ok(socket) = std::net::UdpSocket::bind("[::]:0") {
+        if socket.connect("[2606:4700:4700::1111]:80").is_ok() {
+            if let Ok(local) = socket.local_addr() {
+                let ip = local.ip();
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    ips.push(ip);
+                }
+            }
+        }
+    }
+    ips
+}
+
+pub fn cidr_contains_ip(cidr: &str, target: std::net::IpAddr) -> bool {
+    let (ip_str, mask_str) = match cidr.split_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (cidr, None),
+    };
+    let Ok(net_addr) = ip_str.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match (net_addr, target) {
+        (std::net::IpAddr::V4(net_v4), std::net::IpAddr::V4(target_v4)) => {
+            let mask_bits = mask_str
+                .and_then(|m| m.parse::<u8>().ok())
+                .unwrap_or(32)
+                .min(32);
+            let mask = if mask_bits == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - mask_bits)
+            };
+            (u32::from(net_v4) & mask) == (u32::from(target_v4) & mask)
+        }
+        (std::net::IpAddr::V6(net_v6), std::net::IpAddr::V6(target_v6)) => {
+            let mask_bits = mask_str
+                .and_then(|m| m.parse::<u8>().ok())
+                .unwrap_or(128)
+                .min(128);
+            let mask = if mask_bits == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - mask_bits)
+            };
+            (u128::from(net_v6) & mask) == (u128::from(target_v6) & mask)
+        }
+        _ => false,
+    }
+}
+
 pub fn is_protected_cidr(cidr: &str) -> bool {
     let raw = cidr.trim();
     if raw.is_empty() {
         return true;
+    }
+    for local_ip in get_local_node_ips() {
+        if cidr_contains_ip(raw, local_ip) {
+            return true;
+        }
     }
     let (addr_str, mask_opt) = match raw.split_once('/') {
         Some((a, m)) => (a, Some(m)),
@@ -350,6 +428,11 @@ pub fn is_protected(ip: &str) -> bool {
         // Неразобранный адрес не блокируем: неизвестно, что это.
         return true;
     };
+    for local_ip in get_local_node_ips() {
+        if addr == local_ip {
+            return true;
+        }
+    }
     match addr {
         std::net::IpAddr::V4(v4) => {
             v4.is_loopback()
@@ -478,7 +561,7 @@ fn parse_counter_stats(text: &str) -> (u64, u64) {
     let mut total_packets = 0u64;
     let mut total_bytes = 0u64;
     for line in text.lines() {
-        if line.contains("@scanners4") || line.contains("@scanners6") {
+        if line.contains("@scanners4") || line.contains("@scanners6") || line.contains("synlimit") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for i in 0..parts.len() {
                 if parts[i] == "packets" && i + 1 < parts.len() {
@@ -660,6 +743,24 @@ mod tests {
     }
 
     #[test]
+    fn проверка_вхождения_ip_в_cidr() {
+        let ip: std::net::IpAddr = "104.128.130.148".parse().unwrap();
+        assert!(cidr_contains_ip("104.128.130.148", ip));
+        assert!(cidr_contains_ip("104.128.130.148/32", ip));
+        assert!(cidr_contains_ip("104.128.130.0/24", ip));
+        assert!(cidr_contains_ip("104.128.0.0/16", ip));
+        assert!(cidr_contains_ip("0.0.0.0/0", ip));
+        assert!(!cidr_contains_ip("104.128.131.0/24", ip));
+        assert!(!cidr_contains_ip("1.1.1.1/32", ip));
+
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(cidr_contains_ip("2001:db8::/32", v6));
+        assert!(cidr_contains_ip("2001:db8::1/128", v6));
+        assert!(cidr_contains_ip("::/0", v6));
+        assert!(!cidr_contains_ip("2001:db9::/32", v6));
+    }
+
+    #[test]
     fn разбор_статистики_counter() {
         let nft_out = "
 table inet stealthnet {
@@ -667,11 +768,12 @@ table inet stealthnet {
         type filter hook input priority filter; policy accept;
         ip saddr @scanners4 counter packets 3120 bytes 249600 drop
         ip6 saddr @scanners6 counter packets 5 bytes 400 drop
+        tcp flags syn meter synlimit4 size 65535 { ip saddr limit rate over 200/second burst 300 packets } counter packets 15 bytes 900 drop
     }
 }";
         let (packets, bytes) = parse_counter_stats(nft_out);
-        assert_eq!(packets, 3125);
-        assert_eq!(bytes, 250000);
+        assert_eq!(packets, 3140);
+        assert_eq!(bytes, 250900);
     }
 }
 
