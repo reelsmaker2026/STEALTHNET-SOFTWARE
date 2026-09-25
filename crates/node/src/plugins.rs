@@ -11,6 +11,7 @@
 //! продолжает тратить ресурсы ноды.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,40 @@ use serde::{Deserialize, Serialize};
 /// Имя таблицы. Своё, чтобы не тронуть чужие правила на сервере:
 /// панель ставят на машины, где уже что-то настроено.
 const TABLE: &str = "stealthnet";
+
+pub const DEFAULT_ANTISCANNER_SOURCES: &[&str] = &[
+    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list",
+    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list",
+    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/skipa.list",
+];
+
+const ANTISCANNER_CACHE_PATHS: &[&str] = &[
+    "/var/lib/sn-node/antiscanner.list",
+    "/tmp/sn-node-antiscanner.list",
+];
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AntiScanner {
+    pub enabled: bool,
+    /// Ссылки на списки подсетей (например, правительственные сети, сканеры, СКИПА).
+    pub sources: Vec<String>,
+    /// Интервал обновления списков в секундах (по умолчанию 43200 — 12 часов).
+    pub update_interval_secs: u64,
+    /// Дополнительные адреса или подсети для ручной блокировки.
+    pub custom_ips: Vec<String>,
+}
+
+impl Default for AntiScanner {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sources: DEFAULT_ANTISCANNER_SOURCES.iter().map(|s| s.to_string()).collect(),
+            update_interval_secs: 43200,
+            custom_ips: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 // Панель шлёт camelCase — то же, что в документации Remnawave, чтобы
@@ -30,6 +65,8 @@ pub struct PluginConfig {
     pub torrent_blocker: TorrentBlocker,
     /// Переиспользуемые списки: на них ссылаются фильтры по имени.
     pub shared_lists: Vec<SharedList>,
+    /// Антисканер: защита от массового сканирования и активного зондирования.
+    pub anti_scanner: AntiScanner,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -73,7 +110,10 @@ impl PluginConfig {
     /// каждой ноде — а на сервере без nftables ещё и писал об этом в
     /// журнал, пока тот не переставал быть читаемым.
     pub fn is_noop(&self) -> bool {
-        !self.ingress_filter.enabled && !self.egress_filter.enabled && !self.torrent_blocker.enabled
+        !self.ingress_filter.enabled
+            && !self.egress_filter.enabled
+            && !self.torrent_blocker.enabled
+            && !self.anti_scanner.enabled
     }
 }
 
@@ -86,6 +126,10 @@ pub struct PluginStatus {
     pub kernel: String,
     pub applied: bool,
     pub error: Option<String>,
+    pub antiscanner_enabled: bool,
+    pub antiscanner_rules_count: usize,
+    pub antiscanner_dropped_packets: u64,
+    pub antiscanner_dropped_bytes: u64,
 }
 
 /// Есть ли nftables и хватает ли прав.
@@ -110,7 +154,25 @@ pub fn probe() -> PluginStatus {
             .map(|o| o.status.success())
             .unwrap_or(false);
 
-    PluginStatus { nft_available, can_modify, kernel, applied: false, error: None }
+    let (packets, bytes) = if can_modify {
+        get_antiscanner_dropped_stats()
+    } else {
+        (0, 0)
+    };
+
+    let cached = load_antiscanner_ips();
+
+    PluginStatus {
+        nft_available,
+        can_modify,
+        kernel,
+        applied: false,
+        error: None,
+        antiscanner_enabled: false,
+        antiscanner_rules_count: cached.len(),
+        antiscanner_dropped_packets: packets,
+        antiscanner_dropped_bytes: bytes,
+    }
 }
 
 /// Разворачивает ссылки на общие списки в конкретные адреса.
@@ -154,6 +216,16 @@ pub fn apply(cfg: &PluginConfig) -> Result<(), String> {
     let (in4, in6) = split_family(&ingress);
     let (eg4, eg6) = split_family(&egress);
 
+    let (scanners4, scanners6) = if cfg.anti_scanner.enabled {
+        let mut list = load_antiscanner_ips();
+        list.extend(expand(&cfg.anti_scanner.custom_ips, lists));
+        let mut seen = HashSet::new();
+        list.retain(|v| !is_protected_cidr(v) && seen.insert(v.clone()));
+        split_family(&list)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     let mut s = String::new();
     // Пересоздаём таблицу целиком: так состояние ядра всегда равно
     // конфигурации, и «остатки» прошлых правил не накапливаются.
@@ -179,6 +251,8 @@ pub fn apply(cfg: &PluginConfig) -> Result<(), String> {
     s.push_str(&set("ingress6", "ipv6_addr", &in6));
     s.push_str(&set("egress4", "ipv4_addr", &eg4));
     s.push_str(&set("egress6", "ipv6_addr", &eg6));
+    s.push_str(&set("scanners4", "ipv4_addr", &scanners4));
+    s.push_str(&set("scanners6", "ipv6_addr", &scanners6));
 
     let ports = &cfg.egress_filter.blocked_ports;
     if ports.is_empty() {
@@ -200,6 +274,10 @@ pub fn apply(cfg: &PluginConfig) -> Result<(), String> {
         s.push_str("    ip saddr @ingress4 counter drop\n");
         s.push_str("    ip6 saddr @ingress6 counter drop\n");
     }
+    if cfg.anti_scanner.enabled {
+        s.push_str("    ip saddr @scanners4 counter drop\n");
+        s.push_str("    ip6 saddr @scanners6 counter drop\n");
+    }
     s.push_str("  }\n");
 
     s.push_str("  chain output {\n");
@@ -217,6 +295,48 @@ pub fn apply(cfg: &PluginConfig) -> Result<(), String> {
     run_nft(&s)
 }
 
+pub fn is_valid_cidr_or_ip(s: &str) -> bool {
+    let (ip_str, mask_str) = match s.split_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (s, None),
+    };
+    let Ok(addr) = ip_str.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    if let Some(m) = mask_str {
+        let Ok(bits) = m.parse::<u8>() else {
+            return false;
+        };
+        let max_bits = if addr.is_ipv4() { 32 } else { 128 };
+        if bits > max_bits {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn is_protected_cidr(cidr: &str) -> bool {
+    let raw = cidr.trim();
+    if raw.is_empty() {
+        return true;
+    }
+    let (addr_str, mask_opt) = match raw.split_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (raw, None),
+    };
+    if let Some(mask_str) = mask_opt {
+        if let Ok(bits) = mask_str.parse::<u8>() {
+            let is_v6 = addr_str.contains(':');
+            if (!is_v6 && bits < 8) || (is_v6 && bits < 16) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    is_protected(addr_str)
+}
+
 /// Адреса, которые нельзя блокировать никогда.
 ///
 /// Клиент ходит через VPN с того же адреса, с которого администратор
@@ -232,16 +352,149 @@ pub fn is_protected(ip: &str) -> bool {
     };
     match addr {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_broadcast()
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
                 || v4.is_unspecified()
+                || v4.is_multicast()
         }
         std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified()
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
                 // fc00::/7 — приватные, fe80::/10 — локальные.
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+pub fn antiscanner_cache_path() -> PathBuf {
+    for p in ANTISCANNER_CACHE_PATHS {
+        let path = PathBuf::from(p);
+        if let Some(parent) = path.parent() {
+            if parent.exists() {
+                return path;
+            }
+        }
+    }
+    PathBuf::from("/tmp/sn-node-antiscanner.list")
+}
+
+pub fn load_antiscanner_ips() -> Vec<String> {
+    for p in ANTISCANNER_CACHE_PATHS {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            let ips: Vec<String> = content
+                .lines()
+                .map(|l| l.split(['#', ';']).next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty() && !is_protected_cidr(l) && is_valid_cidr_or_ip(l))
+                .map(String::from)
+                .collect();
+            if !ips.is_empty() {
+                return ips;
+            }
+        }
+    }
+    Vec::new()
+}
+
+pub async fn sync_antiscanner_lists(
+    http: &reqwest::Client,
+    sources: &[String],
+) -> Result<usize, String> {
+    let mut all_cidrs = HashSet::new();
+    let mut any_success = false;
+    let mut errors = Vec::new();
+
+    for url in sources {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        match http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(text) = resp.text().await {
+                    any_success = true;
+                    for line in text.lines() {
+                        let clean = line.split(['#', ';']).next().unwrap_or("").trim();
+                        if clean.is_empty() {
+                            continue;
+                        }
+                        if !is_protected_cidr(clean) && is_valid_cidr_or_ip(clean) {
+                            all_cidrs.insert(clean.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                errors.push(format!("{url}: HTTP {}", resp.status()));
+            }
+            Err(e) => {
+                errors.push(format!("{url}: {e}"));
+            }
+        }
+    }
+
+    if !any_success && !errors.is_empty() {
+        return Err(format!("не удалось скачать списки: {}", errors.join("; ")));
+    }
+
+    let count = all_cidrs.len();
+    if count > 0 {
+        let mut sorted: Vec<String> = all_cidrs.into_iter().collect();
+        sorted.sort();
+        let content = sorted.join("\n");
+        let path = antiscanner_cache_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, content);
+    }
+
+    Ok(count)
+}
+
+pub fn get_antiscanner_dropped_stats() -> (u64, u64) {
+    let Ok(out) = Command::new("nft")
+        .args(["list", "chain", "inet", TABLE, "input"])
+        .output()
+    else {
+        return (0, 0);
+    };
+    if !out.status.success() {
+        return (0, 0);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_counter_stats(&text)
+}
+
+fn parse_counter_stats(text: &str) -> (u64, u64) {
+    let mut total_packets = 0u64;
+    let mut total_bytes = 0u64;
+    for line in text.lines() {
+        if line.contains("@scanners4") || line.contains("@scanners6") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for i in 0..parts.len() {
+                if parts[i] == "packets" && i + 1 < parts.len() {
+                    if let Ok(p) = parts[i + 1].parse::<u64>() {
+                        total_packets += p;
+                    }
+                }
+                if parts[i] == "bytes" && i + 1 < parts.len() {
+                    if let Ok(b) = parts[i + 1].parse::<u64>() {
+                        total_bytes += b;
+                    }
+                }
+            }
+        }
+    }
+    (total_packets, total_bytes)
 }
 
 /// Блокирует адрес на время. `0` — до перезагрузки ноды.
@@ -366,6 +619,59 @@ mod tests {
         assert!(expand(&cfg.ingress_filter.blocked_ips, lists).is_empty());
         assert!(!cfg.ingress_filter.enabled);
         assert!(!cfg.torrent_blocker.enabled);
+        assert!(!cfg.anti_scanner.enabled);
         assert_eq!(cfg.torrent_blocker.block_duration, 3600);
+        assert_eq!(cfg.anti_scanner.update_interval_secs, 43200);
+    }
+
+    #[test]
+    fn антисканер_конфиг_разбирается() {
+        let json = serde_json::json!({
+            "antiScanner": {
+                "enabled": true,
+                "sources": ["https://example.com/block.list"],
+                "updateIntervalSecs": 86400,
+                "customIps": ["198.51.100.0/24"]
+            }
+        });
+        let cfg: PluginConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.anti_scanner.enabled);
+        assert_eq!(cfg.anti_scanner.sources, vec!["https://example.com/block.list"]);
+        assert_eq!(cfg.anti_scanner.update_interval_secs, 86400);
+        assert_eq!(cfg.anti_scanner.custom_ips, vec!["198.51.100.0/24"]);
+        assert!(!cfg.is_noop());
+    }
+
+    #[test]
+    fn антисканер_фильтрует_опасные_подсети() {
+        assert!(is_protected_cidr("0.0.0.0/0"), "0.0.0.0/0 должно быть защищено");
+        assert!(is_protected_cidr("10.0.0.0/8"), "10.0.0.0/8 должно быть защищено");
+        assert!(is_protected_cidr("192.168.1.0/24"), "192.168.1.0/24 должно быть защищено");
+        assert!(is_protected_cidr("127.0.0.1/32"), "127.0.0.1/32 должно быть защищено");
+        assert!(is_protected_cidr("::1/128"), "::1/128 должно быть защищено");
+        assert!(is_protected_cidr("1.0.0.0/4"), "широкая маска /4 должна быть защищена");
+        assert!(!is_protected_cidr("198.51.100.0/24"), "публичная подсеть не должна быть защищена");
+        assert!(!is_protected_cidr("95.173.136.0/21"), "сканерная подсеть должна проходить фильтр");
+
+        assert!(is_valid_cidr_or_ip("198.51.100.0/24"));
+        assert!(is_valid_cidr_or_ip("2001:db8::/32"));
+        assert!(!is_valid_cidr_or_ip("999.999.999.999/24"));
+        assert!(!is_valid_cidr_or_ip("1.2.3.4/33"));
+    }
+
+    #[test]
+    fn разбор_статистики_counter() {
+        let nft_out = "
+table inet stealthnet {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        ip saddr @scanners4 counter packets 3120 bytes 249600 drop
+        ip6 saddr @scanners6 counter packets 5 bytes 400 drop
+    }
+}";
+        let (packets, bytes) = parse_counter_stats(nft_out);
+        assert_eq!(packets, 3125);
+        assert_eq!(bytes, 250000);
     }
 }
+
