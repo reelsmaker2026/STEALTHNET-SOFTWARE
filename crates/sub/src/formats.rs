@@ -141,7 +141,7 @@ impl HostEntry {
         if self.protocol == "shadowsocks" {
             return self.to_ss_link();
         }
-        if self.protocol == "hysteria" {
+        if self.protocol == "hysteria" || self.protocol == "hysteria2" {
             return self.to_hysteria_link();
         }
 
@@ -265,14 +265,14 @@ impl HostEntry {
         // со свежим ядром — при том что сам инбаунд на ноде работал.
         // Значение из базы здесь не спрашиваем: у этого протокола
         // другого транспорта не бывает.
-        let network = if self.protocol == "hysteria" { "hysteria" } else { &self.network };
+        let network = if matches!(self.protocol.as_str(), "hysteria" | "hysteria2") { "hysteria" } else { &self.network };
 
         let mut stream = json!({
             "network": network,
             "security": if self.security == "none" { "none" } else { &self.security },
         });
 
-        if self.protocol == "hysteria" {
+        if matches!(self.protocol.as_str(), "hysteria" | "hysteria2") {
             stream["hysteriaSettings"] = json!({"version":2,"auth":self.credential()});
         }
 
@@ -365,7 +365,7 @@ impl HostEntry {
                 }]
             }),
             // Server location belongs to the protocol; auth to hysteriaSettings.
-            "hysteria" => json!({
+            "hysteria" | "hysteria2" => json!({
                 "version": 2,
                 "address": self.address,
                 "port": self.port,
@@ -393,9 +393,10 @@ impl HostEntry {
             }),
         };
 
+        let proto = if self.protocol == "hysteria2" { "hysteria" } else { &self.protocol };
         let mut outbound=json!({
             "tag": self.remark,
-            "protocol": self.protocol,
+            "protocol": proto,
             "settings": settings,
             "streamSettings": self.stream_settings(),
         });
@@ -405,20 +406,46 @@ impl HostEntry {
 
     /// proxy-запись для Clash / mihomo (YAML).
     pub fn to_clash_proxy(&self) -> String {
+        let (clash_type, auth_field) = match self.protocol.as_str() {
+            "hysteria" | "hysteria2" => ("hysteria2", "password"),
+            "trojan" => ("trojan", "password"),
+            "shadowsocks" => ("ss", "password"),
+            _ => (self.protocol.as_str(), "uuid"),
+        };
         let mut lines = vec![
             format!("  - name: {}", serde_json::to_string(&self.remark).unwrap()),
-            format!("    type: {}", self.protocol),
+            format!("    type: {clash_type}"),
             format!("    server: {}", self.address),
             format!("    port: {}", self.port),
-            format!("    uuid: {}", self.uuid),
-            "    udp: true".to_string(),
         ];
+        if auth_field == "password" {
+            lines.push(format!("    password: {}", self.credential()));
+        } else {
+            lines.push(format!("    uuid: {}", self.uuid));
+        }
+        if self.protocol == "shadowsocks" {
+            let cipher = self.method.as_deref().unwrap_or("2022-blake3-aes-128-gcm");
+            lines.push(format!("    cipher: {cipher}"));
+        }
+        lines.push("    udp: true".to_string());
         if self.protocol == "vless" {
             lines.push("    encryption: none".into());
         }
-        lines.push(format!("    network: {}", self.network));
+        if !matches!(self.protocol.as_str(), "hysteria" | "hysteria2" | "shadowsocks") {
+            lines.push(format!("    network: {}", self.network));
+        }
 
-        if self.security == "reality" {
+        if matches!(self.protocol.as_str(), "hysteria" | "hysteria2") {
+            if let Some(sni) = &self.sni {
+                lines.push(format!("    sni: {sni}"));
+            }
+            if let Some(insecure) = self.options["allow_insecure"].as_bool() {
+                lines.push(format!("    skip-cert-verify: {insecure}"));
+            }
+            if let Some(alpn) = &self.alpn {
+                lines.push(format!("    alpn: [{alpn}]"));
+            }
+        } else if self.security == "reality" {
             lines.push("    tls: true".into());
             if let Some(sni) = &self.sni {
                 lines.push(format!("    servername: {sni}"));
@@ -674,14 +701,39 @@ pub fn render_singbox(hosts: &[HostEntry], profile_title: &str) -> Value {
     let outbounds: Vec<Value> = hosts
         .iter()
         .map(|h| {
+            let (sb_type, auth_key) = match h.protocol.as_str() {
+                "hysteria" | "hysteria2" => ("hysteria2", "password"),
+                "trojan" => ("trojan", "password"),
+                "shadowsocks" => ("shadowsocks", "password"),
+                _ => (h.protocol.as_str(), "uuid"),
+            };
             let mut o = json!({
-                "type": h.protocol,
+                "type": sb_type,
                 "tag": h.remark,
                 "server": h.address,
                 "server_port": h.port,
-                "uuid": h.uuid,
             });
-            if h.security == "reality" {
+            if auth_key == "password" {
+                o["password"] = json!(h.credential());
+            } else {
+                o["uuid"] = json!(h.uuid);
+            }
+            if h.protocol == "shadowsocks" {
+                o["method"] = json!(h.method.as_deref().unwrap_or("2022-blake3-aes-128-gcm"));
+            }
+            if matches!(h.protocol.as_str(), "hysteria" | "hysteria2") {
+                let mut tls = json!({ "enabled": true });
+                if let Some(sni) = &h.sni {
+                    tls["server_name"] = json!(sni);
+                }
+                if let Some(insecure) = h.options["allow_insecure"].as_bool() {
+                    tls["insecure"] = json!(insecure);
+                }
+                if let Some(alpn) = &h.alpn {
+                    tls["alpn"] = json!([alpn]);
+                }
+                o["tls"] = tls;
+            } else if h.security == "reality" {
                 o["tls"] = json!({
                     "enabled": true,
                     "server_name": h.sni.clone().unwrap_or_default(),
@@ -787,6 +839,47 @@ mod tests {
         assert!(out["settings"]["servers"].is_null());
         assert!(out["settings"]["vnext"].is_null());
         assert!(h.to_share_link().starts_with("hysteria2://"));
+    }
+
+    #[test]
+    fn hysteria2_отдаёт_пароль_в_clash_и_singbox() {
+        let h = host_of("hysteria2", "raw", "tls");
+        let clash = h.to_clash_proxy();
+        assert!(clash.contains("type: hysteria2"));
+        assert!(clash.contains(&format!("password: {}", h.uuid)));
+        assert!(!clash.contains("uuid:"));
+
+        let sb = render_singbox(&[h.clone()], "TEST");
+        let out = &sb["outbounds"][0];
+        assert_eq!(out["type"], "hysteria2");
+        assert_eq!(out["password"], h.uuid);
+        assert!(out["uuid"].is_null());
+        assert_eq!(out["tls"]["enabled"], true);
+    }
+
+    #[test]
+    fn trojan_и_shadowsocks_в_clash_и_singbox() {
+        let tr = host_of("trojan", "tcp", "tls");
+        let clash_tr = tr.to_clash_proxy();
+        assert!(clash_tr.contains("type: trojan"));
+        assert!(clash_tr.contains(&format!("password: {}", tr.uuid)));
+        assert!(!clash_tr.contains("uuid:"));
+
+        let sb_tr = render_singbox(&[tr], "TEST");
+        assert_eq!(sb_tr["outbounds"][0]["type"], "trojan");
+        assert_eq!(sb_tr["outbounds"][0]["password"], "8a2f1c9e-3b47-4e5d-9f01-c2ab34d96e11");
+
+        let ss = host_of("shadowsocks", "tcp", "none");
+        let clash_ss = ss.to_clash_proxy();
+        assert!(clash_ss.contains("type: ss"));
+        assert!(clash_ss.contains("cipher: 2022-blake3-aes-128-gcm"));
+        assert!(clash_ss.contains("password:"));
+        assert!(!clash_ss.contains("uuid:"));
+
+        let sb_ss = render_singbox(&[ss], "TEST");
+        assert_eq!(sb_ss["outbounds"][0]["type"], "shadowsocks");
+        assert_eq!(sb_ss["outbounds"][0]["method"], "2022-blake3-aes-128-gcm");
+        assert!(sb_ss["outbounds"][0]["password"].is_string());
     }
 
     #[test]
