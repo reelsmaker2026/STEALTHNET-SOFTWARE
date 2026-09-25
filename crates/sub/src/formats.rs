@@ -478,6 +478,37 @@ impl HostEntry {
                 "      path: {}",
                 self.path.clone().unwrap_or_else(|| "/".into())
             ));
+            if let Some(h) = self.host_header.as_ref().or(self.sni.as_ref()).filter(|s| !s.is_empty()) {
+                lines.push("      headers:".into());
+                lines.push(format!("        Host: {h}"));
+            }
+        } else if self.network == "grpc" {
+            lines.push("    grpc-opts:".into());
+            lines.push(format!(
+                "      grpc-service-name: {}",
+                self.service_name.clone().unwrap_or_default()
+            ));
+        } else if self.network == "httpupgrade" {
+            lines.push("    httpupgrade-opts:".into());
+            lines.push(format!(
+                "      path: {}",
+                self.path.clone().unwrap_or_else(|| "/".into())
+            ));
+            if let Some(h) = self.host_header.as_ref().or(self.sni.as_ref()).filter(|s| !s.is_empty()) {
+                lines.push(format!("      host: {h}"));
+            }
+        } else if matches!(self.network.as_str(), "xhttp" | "splithttp") {
+            lines.push("    xhttp-opts:".into());
+            lines.push(format!(
+                "      path: {}",
+                self.path.clone().unwrap_or_else(|| "/".into())
+            ));
+            if let Some(h) = self.host_header.as_ref().or(self.sni.as_ref()).filter(|s| !s.is_empty()) {
+                lines.push(format!("      host: {h}"));
+            }
+            if let Some(mode) = self.options["xhttp"]["mode"].as_str().filter(|s| !s.is_empty()) {
+                lines.push(format!("      mode: {mode}"));
+            }
         }
         if let Some(value)=self.options["allow_insecure"].as_bool(){if self.security=="tls"{lines.push(format!("    skip-cert-verify: {value}"));}}
         if let Some(description)=self.options["server_description"].as_str().filter(|s|!s.is_empty()){lines.push(format!("    description: {}",serde_json::to_string(description).unwrap()));}
@@ -753,10 +784,28 @@ pub fn render_singbox(hosts: &[HostEntry], profile_title: &str) -> Value {
                 });
             }
             if h.network == "ws" {
-                o["transport"] = json!({
+                let mut ws = json!({
                     "type": "ws",
                     "path": h.path.clone().unwrap_or_else(|| "/".into()),
                 });
+                if let Some(host) = h.host_header.as_ref().or(h.sni.as_ref()).filter(|s| !s.is_empty()) {
+                    ws["headers"] = json!({ "Host": host });
+                }
+                o["transport"] = ws;
+            } else if h.network == "grpc" {
+                o["transport"] = json!({
+                    "type": "grpc",
+                    "service_name": h.service_name.clone().unwrap_or_default(),
+                });
+            } else if h.network == "httpupgrade" {
+                let mut hu = json!({
+                    "type": "httpupgrade",
+                    "path": h.path.clone().unwrap_or_else(|| "/".into()),
+                });
+                if let Some(host) = h.host_header.as_ref().or(h.sni.as_ref()).filter(|s| !s.is_empty()) {
+                    hu["host"] = json!(host);
+                }
+                o["transport"] = hu;
             }
             if h.security=="tls"{if let Some(value)=h.options["allow_insecure"].as_bool(){o["tls"]["insecure"]=json!(value);}}
             o
@@ -1235,5 +1284,39 @@ mod tests {
             assert_eq!(c["inbounds"][0]["port"], 10808);
             assert_eq!(c["inbounds"][1]["port"], 10809);
         }
+    }
+
+    #[test]
+    fn grpc_httpupgrade_xhttp_в_clash_и_singbox() {
+        let grpc = host_of("vless", "grpc", "tls");
+        let clash_grpc = grpc.to_clash_proxy();
+        assert!(clash_grpc.contains("network: grpc"));
+        assert!(clash_grpc.contains("grpc-opts:"));
+        assert!(clash_grpc.contains("grpc-service-name: grpcsvc"));
+
+        let sb_grpc = render_singbox(&[grpc], "TEST");
+        assert_eq!(sb_grpc["outbounds"][0]["transport"]["type"], "grpc");
+        assert_eq!(sb_grpc["outbounds"][0]["transport"]["service_name"], "grpcsvc");
+
+        let hu = host_of("vless", "httpupgrade", "tls");
+        let clash_hu = hu.to_clash_proxy();
+        assert!(clash_hu.contains("network: httpupgrade"));
+        assert!(clash_hu.contains("httpupgrade-opts:"));
+        assert!(clash_hu.contains("path: /tunnel"));
+        assert!(clash_hu.contains("host: de.example.net"));
+
+        let sb_hu = render_singbox(&[hu], "TEST");
+        assert_eq!(sb_hu["outbounds"][0]["transport"]["type"], "httpupgrade");
+        assert_eq!(sb_hu["outbounds"][0]["transport"]["path"], "/tunnel");
+        assert_eq!(sb_hu["outbounds"][0]["transport"]["host"], "de.example.net");
+
+        let mut xhttp = host_of("vless", "xhttp", "tls");
+        xhttp.options = json!({ "xhttp": { "mode": "stream-up" } });
+        let clash_xhttp = xhttp.to_clash_proxy();
+        assert!(clash_xhttp.contains("network: xhttp"));
+        assert!(clash_xhttp.contains("xhttp-opts:"));
+        assert!(clash_xhttp.contains("path: /tunnel"));
+        assert!(clash_xhttp.contains("host: de.example.net"));
+        assert!(clash_xhttp.contains("mode: stream-up"));
     }
 }
