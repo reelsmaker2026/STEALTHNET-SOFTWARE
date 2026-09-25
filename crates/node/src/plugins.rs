@@ -195,13 +195,145 @@ fn expand(items: &[String], lists: &[SharedList]) -> Vec<String> {
     out
 }
 
-/// Отделяет IPv4 от IPv6: в nftables это разные типы наборов.
+pub fn collapse_cidrs_v4(items: &[String]) -> Vec<String> {
+    struct Entry {
+        start: u32,
+        end: u32,
+        raw: String,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for s in items {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (ip_str, mask_str) = match trimmed.split_once('/') {
+            Some((a, m)) => (a, Some(m)),
+            None => (trimmed, None),
+        };
+        let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        let mask = mask_str
+            .and_then(|m| m.parse::<u8>().ok())
+            .unwrap_or(32)
+            .min(32);
+        let ip_u32 = u32::from(ip);
+        let netmask = if mask == 0 {
+            0u32
+        } else {
+            !0u32 << (32 - mask)
+        };
+        let start = ip_u32 & netmask;
+        let end = if mask == 0 {
+            u32::MAX
+        } else {
+            start | !netmask
+        };
+        let raw = if mask == 32 {
+            std::net::Ipv4Addr::from(start).to_string()
+        } else {
+            format!("{}/{}", std::net::Ipv4Addr::from(start), mask)
+        };
+        entries.push(Entry { start, end, raw });
+    }
+
+    // Сортируем: сначала меньший start, при равном start — больший end (более широкая сеть первой)
+    entries.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
+
+    let mut result = Vec::new();
+    let mut last_end: Option<u32> = None;
+
+    for entry in entries {
+        if let Some(prev_end) = last_end {
+            if entry.start <= prev_end {
+                continue;
+            }
+        }
+        last_end = Some(entry.end);
+        result.push(entry.raw);
+    }
+
+    result
+}
+
+pub fn collapse_cidrs_v6(items: &[String]) -> Vec<String> {
+    struct Entry {
+        start: u128,
+        end: u128,
+        raw: String,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for s in items {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (ip_str, mask_str) = match trimmed.split_once('/') {
+            Some((a, m)) => (a, Some(m)),
+            None => (trimmed, None),
+        };
+        let Ok(ip) = ip_str.parse::<std::net::Ipv6Addr>() else {
+            continue;
+        };
+        let mask = mask_str
+            .and_then(|m| m.parse::<u8>().ok())
+            .unwrap_or(128)
+            .min(128);
+        let ip_u128 = u128::from(ip);
+        let netmask = if mask == 0 {
+            0u128
+        } else {
+            !0u128 << (128 - mask)
+        };
+        let start = ip_u128 & netmask;
+        let end = if mask == 0 {
+            u128::MAX
+        } else {
+            start | !netmask
+        };
+        let raw = if mask == 128 {
+            std::net::Ipv6Addr::from(start).to_string()
+        } else {
+            format!("{}/{}", std::net::Ipv6Addr::from(start), mask)
+        };
+        entries.push(Entry { start, end, raw });
+    }
+
+    entries.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
+
+    let mut result = Vec::new();
+    let mut last_end: Option<u128> = None;
+
+    for entry in entries {
+        if let Some(prev_end) = last_end {
+            if entry.start <= prev_end {
+                continue;
+            }
+        }
+        last_end = Some(entry.end);
+        result.push(entry.raw);
+    }
+
+    result
+}
+
+/// Отделяет IPv4 от IPv6 и сворачивает перекрывающиеся подсети, исключая конфликты в nftables.
 fn split_family(items: &[String]) -> (Vec<String>, Vec<String>) {
-    items
-        .iter()
-        .filter(|s| !s.trim().is_empty())
-        .cloned()
-        .partition(|s| !s.contains(':'))
+    let mut v4_raw = Vec::new();
+    let mut v6_raw = Vec::new();
+    for s in items {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains(':') {
+            v6_raw.push(trimmed.to_string());
+        } else {
+            v4_raw.push(trimmed.to_string());
+        }
+    }
+    (collapse_cidrs_v4(&v4_raw), collapse_cidrs_v6(&v6_raw))
 }
 
 /// Собирает и применяет правила одним вызовом `nft -f -`.
@@ -774,6 +906,28 @@ table inet stealthnet {
         let (packets, bytes) = parse_counter_stats(nft_out);
         assert_eq!(packets, 3140);
         assert_eq!(bytes, 250900);
+    }
+
+    #[test]
+    fn коллапсирование_перекрывающихся_подсетей() {
+        let raw_v4 = vec![
+            "10.0.0.0/8".into(),
+            "10.1.0.0/16".into(),
+            "10.1.2.3/32".into(),
+            "192.168.1.0/24".into(),
+            "192.168.1.15".into(),
+        ];
+        let v4 = collapse_cidrs_v4(&raw_v4);
+        assert_eq!(v4, vec!["10.0.0.0/8", "192.168.1.0/24"]);
+
+        let raw_v6 = vec![
+            "2a01:230:3::/48".into(),
+            "2a01:230::/32".into(),
+            "2a01:230::/48".into(),
+            "2001:db8::1/128".into(),
+        ];
+        let v6 = collapse_cidrs_v6(&raw_v6);
+        assert_eq!(v6, vec!["2001:db8::1", "2a01:230::/32"]);
     }
 }
 
