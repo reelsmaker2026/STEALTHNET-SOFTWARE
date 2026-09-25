@@ -206,12 +206,14 @@ pub fn render_template(code:&str,body:&str,hosts:&[HostEntry],title:&str)->Resul
                         .and_then(|b| b.as_bool())
                         .unwrap_or(true);
                     if inc {
-                        let existing = out.entry("outbounds").or_insert_with(|| Value::Array(Vec::new()));
-                        if let Some(arr) = existing.as_array_mut() {
-                            for tag in hosts.iter().map(|h| &h.remark) {
-                                let tag_val = json!(tag);
-                                if !arr.contains(&tag_val) {
-                                    arr.push(tag_val);
+                        if let Some(obj) = out.as_object_mut() {
+                            let existing = obj.entry("outbounds").or_insert_with(|| Value::Array(Vec::new()));
+                            if let Some(arr) = existing.as_array_mut() {
+                                for tag in hosts.iter().map(|h| &h.remark) {
+                                    let tag_val = json!(tag);
+                                    if !arr.contains(&tag_val) {
+                                        arr.push(tag_val);
+                                    }
                                 }
                             }
                         }
@@ -273,12 +275,14 @@ pub fn render_template(code:&str,body:&str,hosts:&[HostEntry],title:&str)->Resul
                             proxy_names = vec![picked];
                         }
                     }
-                    let existing = group.entry("proxies").or_insert_with(|| Value::Array(Vec::new()));
-                    if let Some(arr) = existing.as_array_mut() {
-                        for name in proxy_names {
-                            let nval = json!(name);
-                            if !arr.contains(&nval) {
-                                arr.push(nval);
+                    if let Some(obj) = group.as_object_mut() {
+                        let existing = obj.entry("proxies").or_insert_with(|| Value::Array(Vec::new()));
+                        if let Some(arr) = existing.as_array_mut() {
+                            for name in proxy_names {
+                                let nval = json!(name);
+                                if !arr.contains(&nval) {
+                                    arr.push(nval);
+                                }
                             }
                         }
                     }
