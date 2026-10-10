@@ -331,4 +331,71 @@ mod tests {
         let n:i64=sqlx::query_scalar("SELECT count(*) FROM payments WHERE client_id=$1 AND status='success'").bind(client).fetch_one(&pool).await.unwrap();assert_eq!(n,1);
         println!("SN-B05 real DB: signed decimal notification settled once; amount/currency/invoice guards and duplicate term preserved");
     }
+
+    #[tokio::test]
+    #[ignore = "Requires SN_COMBINED_FIXTURE pointing to isolated real API, database and synthetic web account"]
+    async fn combined_amount_http_notification_and_return_contract() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture: Value = serde_json::from_slice(&std::fs::read(
+            std::env::var("SN_COMBINED_FIXTURE").expect("combined fixture must be configured")
+        ).unwrap()).unwrap();
+        let db_url=fixture["database_url"].as_str().unwrap();
+        let pool=sn_core::db::connect(db_url).await.unwrap();
+        let db_name:String=sqlx::query_scalar("SELECT current_database()").fetch_one(&pool).await.unwrap();
+        assert!(db_name.starts_with("sn_audit_r3_web_"));
+        let api=fixture["api_url"].as_str().unwrap();assert!(api.starts_with("http://127.0.0.1:"));
+        let web_return=format!("{}/#payments",fixture["cabinet_url"].as_str().unwrap());
+        let tariff=fixture["tariff_id"].as_i64().unwrap();
+        let http=reqwest::Client::new();let mut proofs=vec![];
+        for channel in ["web","bot","miniapp"] {
+            let tag=uuid::Uuid::new_v4().simple().to_string();
+            let client=if channel=="web" {fixture["web_client_id"].as_i64().unwrap()} else {
+                let id:i64=sqlx::query_scalar("INSERT INTO clients(username,short_id) VALUES($1,$2) RETURNING id").bind(format!("combined_{channel}")).bind(&tag).fetch_one(&pool).await.unwrap();
+                sqlx::query("INSERT INTO subscriptions(client_id,tariff_id) VALUES($1,$2)").bind(id).bind(tariff).execute(&pool).await.unwrap();id
+            };
+            sqlx::query("UPDATE subscriptions SET expires_at=now()+interval '1 day',tariff_id=$2 WHERE client_id=$1 AND is_current").bind(client).bind(tariff).execute(&pool).await.unwrap();
+            let before:chrono::DateTime<chrono::Utc>=sqlx::query_scalar("SELECT expires_at FROM subscriptions WHERE client_id=$1 AND is_current").bind(client).fetch_one(&pool).await.unwrap();
+            let payment:i64=sqlx::query_scalar("INSERT INTO payments(client_id,tariff_id,kind,status,amount_minor,currency,period_days,provider) VALUES($1,$2,'renewal','pending',1999,'RUB',30,'rollypay') RETURNING id").bind(client).bind(tariff).fetch_one(&pool).await.unwrap();
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
+            let response=json!({"payment_id":tag,"pay_url":"https://checkout.example.test/synthetic"}).to_string();
+            let server=tokio::spawn(async move {
+                let (mut stream,_)=listener.accept().await.unwrap();let mut raw=vec![];let mut buf=[0;4096];
+                loop {let n=stream.read(&mut buf).await.unwrap();assert!(n>0);raw.extend_from_slice(&buf[..n]);
+                    if let Some(at)=raw.windows(4).position(|x|x==b"\r\n\r\n") {
+                        let h=String::from_utf8_lossy(&raw[..at]);let size=h.lines().find_map(|x|x.to_lowercase().strip_prefix("content-length:").and_then(|n|n.trim().parse::<usize>().ok())).unwrap();
+                        if raw.len()>=at+4+size {break;}
+                    }
+                }
+                assert!(raw.starts_with(b"POST /api/v1/payments HTTP/1.1\r\n"));
+                let at=raw.windows(4).position(|x|x==b"\r\n\r\n").unwrap();let body:Value=serde_json::from_slice(&raw[at+4..]).unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();body
+            });
+            let mut p=configured(Gateway::RollyPay);p.base=format!("http://{addr}");
+            let fallback=if channel=="bot" {"https://t.me/synthetic_test_bot"} else {"https://miniapp.example.test/app/"};
+            let mut cfg=p.cfg.snapshot();cfg.insert("return_url".into(),json!(fallback));p.cfg.replace(cfg);
+            let req=InvoiceRequest{payment_id:payment,client_id:client,telegram_id:if channel=="web"{None}else{Some(424242)},amount_minor:1999,currency:"RUB".into(),description:"Combined synthetic renewal".into(),return_url:if channel=="web"{Some(web_return.clone())}else{None}};
+            let invoice=p.create_invoice(&req).await.unwrap();assert_eq!(invoice.external_id.as_deref(),Some(tag.as_str()));
+            let captured=server.await.unwrap();let expected_return=if channel=="web"{web_return.as_str()}else{fallback};
+            assert_eq!(captured["amount"],"19.99");assert_eq!(captured["order_id"],format!("sn-{payment}"));
+            for field in ["success_redirect_url","fail_redirect_url"]{assert_eq!(captured[field],expected_return);}
+            sqlx::query("UPDATE payments SET provider_txid=$2,pay_url=$3 WHERE id=$1").bind(payment).bind(&tag).bind(&invoice.pay_url).execute(&pool).await.unwrap();
+            let mut notification=notification(Gateway::RollyPay);notification["payment_id"]=json!(tag);notification["order_id"]=json!(format!("sn-{payment}"));notification["amount"]=json!("19.99000000");
+            let bytes=serde_json::to_vec(&notification).unwrap();let headers=signed_headers(Gateway::RollyPay,&notification,&bytes);
+            let url=format!("{api}/api/pay/webhook/rollypay");
+            let send=|data:Vec<u8>,signed:HashMap<String,String>| {let mut r=http.post(&url).header("Content-Type","application/json").body(data);for (k,v) in signed {r=r.header(k,v);}r.send()};
+            let bad=send(bytes.clone(),HashMap::new()).await.unwrap();assert!(!bad.status().is_success());
+            let mut wrong=notification.clone();wrong["amount"]=json!("19.98000000");let wrong_bytes=serde_json::to_vec(&wrong).unwrap();
+            assert!(!send(wrong_bytes.clone(),signed_headers(Gateway::RollyPay,&wrong,&wrong_bytes)).await.unwrap().status().is_success());
+            let unchanged:chrono::DateTime<chrono::Utc>=sqlx::query_scalar("SELECT expires_at FROM subscriptions WHERE client_id=$1 AND is_current").bind(client).fetch_one(&pool).await.unwrap();assert_eq!(before,unchanged);
+            let first=send(bytes.clone(),headers.clone()).await.unwrap();assert!(first.status().is_success(),"valid exact amount rejected: {}",first.status());assert_eq!(first.json::<Value>().await.unwrap()["ok"],true);
+            let once:chrono::DateTime<chrono::Utc>=sqlx::query_scalar("SELECT expires_at FROM subscriptions WHERE client_id=$1 AND is_current").bind(client).fetch_one(&pool).await.unwrap();assert_eq!(once,before+chrono::Duration::days(30));
+            let (a,b,c)=tokio::join!(send(bytes.clone(),headers.clone()),send(bytes.clone(),headers.clone()),send(bytes.clone(),headers.clone()));
+            for response in [a,b,c]{assert!(response.unwrap().status().is_success());}
+            let after:chrono::DateTime<chrono::Utc>=sqlx::query_scalar("SELECT expires_at FROM subscriptions WHERE client_id=$1 AND is_current").bind(client).fetch_one(&pool).await.unwrap();assert_eq!(after,once);
+            let rows:Vec<(i64,String,i64)>=sqlx::query_as("SELECT id,status::text,amount_minor FROM payments WHERE client_id=$1 ORDER BY id").bind(client).fetch_all(&pool).await.unwrap();assert_eq!(rows,vec![(payment,"success".to_string(),1999)]);
+            proofs.push(json!({"channel":channel,"client_id":client,"payment_id":payment,"request_amount":captured["amount"],"notification_amount":"19.99000000","return_url":expected_return,"before":before,"after_first":once,"after_three_concurrent_repeats":after,"payment_rows":1,"signature_and_wrong_amount_rejected":true}));
+        }
+        std::fs::write(fixture["proof_file"].as_str().unwrap(),serde_json::to_vec_pretty(&json!({"cases":proofs,"provider_transport":"loopback Hosted create_invoice mock","notification_transport":"real HTTP API webhook","invoice_database_setup":"synthetic pending row; checkout API creation itself not exercised"})).unwrap()).unwrap();
+        println!("COMBINED FLOW COMPLETE: web override, bot/Mini App fallback, local invoice create, signed real HTTP notification, 30 days once, 3 concurrent repeats, one invoice per account");
+    }
 }
