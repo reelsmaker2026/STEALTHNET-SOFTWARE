@@ -36,7 +36,7 @@ impl Hosted {
         if req.amount_minor<=0 || !self.currencies().contains(&req.currency){return Err(Error::bad("валюта или сумма не поддерживается платёжным модулем"));}
         let amount=crate::minor_to_units(req.amount_minor,&req.currency);
         let order=format!("sn-{}",req.payment_id);
-        let return_url=self.cfg.get("return_url");
+        let return_url=req.return_url.clone().or_else(||self.cfg.get("return_url"));
         let mut body=match self.kind {
             Gateway::Platega=>json!({"paymentDetails":{"amount":serde_json::from_str::<Value>(&amount).map_err(|_|Error::bad("сумма"))?,"currency":req.currency},"description":req.description,"payload":order,"metadata":{"userId":req.telegram_id.unwrap_or(req.client_id).to_string()}}),
             Gateway::RollyPay=>{
@@ -201,6 +201,41 @@ mod tests {
         }
         let p=configured(Gateway::RollyPay);let mut v=notification(Gateway::RollyPay);v["test"]=json!(true);let b=serde_json::to_vec(&v).unwrap();assert!(p.handle_webhook(&signed_headers(Gateway::RollyPay,&v,&b),&b).await.is_err());
         let mut v=notification(Gateway::ParityPay);v["shop_id"]=json!("different");let b=serde_json::to_vec(&v).unwrap();assert!(configured(Gateway::ParityPay).handle_webhook(&signed_headers(Gateway::ParityPay,&v,&b),&b).await.is_err());
+    }
+    fn return_url_cases()->[(Gateway,&'static str,[&'static str;2]);4] {
+        [
+            (Gateway::Platega,"RUB",["return","failedUrl"]),
+            (Gateway::RollyPay,"RUB",["success_redirect_url","fail_redirect_url"]),
+            (Gateway::RollyPay,"EUR",["success_redirect_url","fail_redirect_url"]),
+            (Gateway::ParityPay,"RUB",["success_url","fail_url"]),
+        ]
+    }
+    #[test] fn invoice_return_url_prefers_request_over_provider_default(){
+        for (kind,currency,fields) in return_url_cases() {
+            for default in [Some("https://service.example/app/"),None] {
+                let provider=configured(kind);
+                if let Some(url)=default {let mut cfg=provider.cfg.snapshot();cfg.insert("return_url".into(),json!(url));provider.cfg.replace(cfg);}
+                let req=InvoiceRequest{payment_id:77,client_id:5,telegram_id:None,amount_minor:17500,currency:currency.into(),description:"Test plan".into(),return_url:Some("https://cabinet.example/#payments".into())};
+                let body=provider.body(&req).unwrap();
+                for field in fields {assert_eq!(body[field],json!("https://cabinet.example/#payments"),"{kind:?} {currency} {field}, configured default: {default:?}");}
+            }
+        }
+    }
+    #[test] fn invoice_return_url_falls_back_to_provider_default(){
+        for (kind,currency,fields) in return_url_cases() {
+            let provider=configured(kind);
+            let mut cfg=provider.cfg.snapshot();cfg.insert("return_url".into(),json!("https://service.example/app/"));provider.cfg.replace(cfg);
+            let req=InvoiceRequest{payment_id:77,client_id:5,telegram_id:Some(11),amount_minor:17500,currency:currency.into(),description:"Test plan".into(),return_url:None};
+            let body=provider.body(&req).unwrap();
+            for field in fields {assert_eq!(body[field],json!("https://service.example/app/"),"{kind:?} {currency} {field}");}
+        }
+    }
+    #[test] fn invoice_return_url_is_omitted_when_unset(){
+        for (kind,currency,fields) in return_url_cases() {
+            let req=InvoiceRequest{payment_id:77,client_id:5,telegram_id:Some(11),amount_minor:17500,currency:currency.into(),description:"Test plan".into(),return_url:None};
+            let body=configured(kind).body(&req).unwrap();
+            for field in fields {assert!(body.get(field).is_none(),"{kind:?} {currency}: unexpected {field}");}
+        }
     }
     #[test] fn decimal_and_invoice_contracts(){
         for (v,n) in [(json!("19.99"),1999),(json!(19.9),1990),(json!("0.01"),1),(json!(1200),120000)]{assert_eq!(amount_minor(&v).unwrap(),n);}

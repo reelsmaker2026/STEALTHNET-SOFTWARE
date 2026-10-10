@@ -135,7 +135,7 @@ function renderSaveCode(){tabs.hidden=true;document.querySelector('#desktopNav')
 async function cabinetBoot(){
   try{config=await api('/config');applyCustomerBrand();mountCustomerHeader();
     try{const auth=await api('/auth/session');cabinetCsrf=auth.csrf;savedCode=auth.code_saved;await enterCabinet();}
-    catch(e){if(e.status!==401)throw e;await renderStorefront();if(location.hash==='#login')showLogin();}
+    catch(e){if(e.status!==401)throw e;await renderStorefront();if(location.hash==='#login'||location.hash==='#payments')showLogin();}
   }catch(e){errorBox(e,cabinetBoot);}
 }
 async function enterCabinet(){
